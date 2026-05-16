@@ -12,7 +12,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 PROCESSED_UPDATES = []
 
 def parse_naver_sise(url):
-    """네이버 금융 시세 메뉴 페이지 파싱"""
+    """네이버 금융 시세 메뉴 페이지 파싱 (불확실한 날짜 추출 로직 제거)"""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
         res = requests.get(url, headers=headers, timeout=5)
@@ -49,7 +49,7 @@ def parse_naver_sise(url):
         return []
 
 def get_stock_fundamentals(ticker):
-    """개별 종목 상세 페이지에서 체결시간 기준 진짜 거래일 추출"""
+    """개별 종목 상세 페이지 파싱 및 실제 장마감 거래일+요일 추적"""
     url = f"https://finance.naver.com/item/main.naver?code={ticker}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
@@ -79,14 +79,21 @@ def get_stock_fundamentals(ticker):
         else:
             per = "N/A"
             
-        # 📅 [근본 해결] 네이버 서버 날짜가 아닌, 해당 종목의 실제 최종 체결일(장마감일)을 조준 타격합니다.
+        # 📅 [정밀 타깃 수정] 네이버 서버 날짜 스크립트를 피해 실제 주식 가격창의 공식 체결일 자리를 파싱합니다.
         market_date = None
-        time_elem = soup.select_one('#_time')
-        if time_elem:
-            time_text = time_elem.get_text(strip=True)
+        date_elem = soup.select_one('.rate_info .date') or soup.select_one('.no_hd .date')
+        if date_elem:
+            time_text = date_elem.get_text(strip=True)
             date_match = re.search(r'(\d{4})\.(\d{2})\.(\d{2})', time_text)
             if date_match:
-                market_date = f"{date_match.group(1)}년 {date_match.group(2)}월 {date_match.group(3)}일"
+                y, m, d = date_match.group(1), date_match.group(2), date_match.group(3)
+                try:
+                    # 요일 자동 계산 로직 적용
+                    dt = datetime.date(int(y), int(m), int(d))
+                    days = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"]
+                    market_date = f"{y}년 {m}월 {d}일 {days[dt.weekday()]}"
+                except:
+                    market_date = f"{y}년 {m}월 {d}일"
             
         return market_sum, per, market_date
     except:
@@ -128,7 +135,6 @@ def get_stock_data():
     with ThreadPoolExecutor(max_workers=12) as executor:
         fundamental_results = list(executor.map(lambda s: get_stock_fundamentals(s['ticker']), flat_stocks))
         
-    # 각 종목에 데이터를 매핑하면서 가장 먼저 발견된 실제 장마감 거래일을 확보합니다.
     market_date = None
     for s, (m_sum, per, m_date) in zip(flat_stocks, fundamental_results):
         s['market_sum'] = m_sum
@@ -136,7 +142,7 @@ def get_stock_data():
         if m_date and not market_date:
             market_date = m_date
             
-    # 혹시 모를 예외 발생 시에만 시스템 현재 날짜로 폴백합니다.
+    # 최후의 수단으로만 현재 시스템 날짜 적용
     if not market_date:
         market_date = datetime.datetime.now().strftime("%Y년 %m월 %d일")
         
@@ -167,7 +173,7 @@ def telegram_webhook():
                     "text": "🔄 당일 거래대금/시총 상위 종목을 스크리닝 중입니다. 잠시만 기다려주세요..."
                 })
                 
-                # ⚡ 고속 스크리닝 엔진 구동 및 진짜 주식 거래일 동적 리턴
+                # ⚡ 고속 스크리닝 엔진 구동 및 검증된 실거래일 수집
                 stock_data, date_str = get_stock_data()
                 
                 # 📊 줄바꿈 및 🔹 이모티콘 포맷터
@@ -182,7 +188,7 @@ def telegram_webhook():
                 val_up_str = make_formatted_lines(stock_data["trading_volume"]["up"])
                 val_down_str = make_formatted_lines(stock_data["trading_volume"]["down"])
                 
-                # ✍️ 다른 LLM 검색용 프롬프트 질문 상단 템플릿 정의
+                # ✍️ 다른 LLM 검색용 프롬프트 질문 템플릿
                 prompt_template = (
                     "아래 12개의 종목에서 \n"
                     "오늘 실적발표가 있었던 종목이 있는지 알려줘. \n"
@@ -190,7 +196,7 @@ def telegram_webhook():
                     "오늘 \"공시\"와 관련된 종목이 있는지 알려줘.\n\n\n\n"
                 )
                 
-                # 🚀 [메시지 2] 완벽하게 검증된 장마감일 기준 리포트 전송
+                # 🚀 [메시지 2] 완벽히 보정된 거래일 날짜가 포함된 최종 리포트 전송
                 msg2_text = (
                     f"{prompt_template}"
                     f"📋 *[{date_str}] 분석 대상 12개 종목 라인업 확정*\n\n"
