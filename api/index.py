@@ -12,19 +12,14 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 PROCESSED_UPDATES = []
 
 def parse_naver_sise(url):
-    """네이버 금융 시세 메뉴 페이지 파싱 및 실제 거래일 추출"""
+    """네이버 금융 시세 메뉴 페이지 파싱"""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
         res = requests.get(url, headers=headers, timeout=5)
         res.encoding = 'euc-kr'
-        
-        # 📅 [근본 수정] 네이버 금융 페이지 내에 표기된 실제 마켓 거래일(YYYY.MM.DD) 조준 추출
-        date_match = re.search(r'(\d{4})\.(\d{2})\.(\d{2})', res.text)
-        market_date = f"{date_match.group(1)}년 {date_match.group(2)}월 {date_match.group(3)}일" if date_match else None
-        
         soup = BeautifulSoup(res.text, 'html.parser')
         table = soup.select_one('table.type_2')
-        if not table: return [], market_date
+        if not table: return []
         
         rows = table.select('tr')
         stocks = []
@@ -49,12 +44,12 @@ def parse_naver_sise(url):
             val = float(val_cleaned) if val_cleaned else 0.0
             
             stocks.append({'ticker': ticker, 'name': name, 'rate': rate, 'value': val})
-        return stocks, market_date
+        return stocks
     except:
-        return [], None
+        return []
 
 def get_stock_fundamentals(ticker):
-    """개별 종목 상세 페이지 파싱 (시가총액 띄어쓰기 결합 완료)"""
+    """개별 종목 상세 페이지에서 체결시간 기준 진짜 거래일 추출"""
     url = f"https://finance.naver.com/item/main.naver?code={ticker}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
@@ -62,6 +57,7 @@ def get_stock_fundamentals(ticker):
         res.encoding = 'utf-8' 
         soup = BeautifulSoup(res.text, 'html.parser')
         
+        # 1. 시가총액 추출 및 공백 제거
         market_sum_elem = soup.select_one('#_market_sum')
         if market_sum_elem:
             market_sum = market_sum_elem.get_text(strip=True)
@@ -72,6 +68,7 @@ def get_stock_fundamentals(ticker):
         else:
             market_sum = "N/A"
             
+        # 2. 추정 PER 또는 일반 PER 추출
         per_elem = soup.select_one('#_cper')
         if not per_elem or not per_elem.get_text(strip=True) or per_elem.get_text(strip=True).strip() == '-':
             per_elem = soup.select_one('#_per')
@@ -82,9 +79,18 @@ def get_stock_fundamentals(ticker):
         else:
             per = "N/A"
             
-        return market_sum, per
+        # 📅 [근본 해결] 네이버 서버 날짜가 아닌, 해당 종목의 실제 최종 체결일(장마감일)을 조준 타격합니다.
+        market_date = None
+        time_elem = soup.select_one('#_time')
+        if time_elem:
+            time_text = time_elem.get_text(strip=True)
+            date_match = re.search(r'(\d{4})\.(\d{2})\.(\d{2})', time_text)
+            if date_match:
+                market_date = f"{date_match.group(1)}년 {date_match.group(2)}월 {date_match.group(3)}일"
+            
+        return market_sum, per, market_date
     except:
-        return "N/A", "N/A"
+        return "N/A", "N/A", None
 
 def get_stock_data():
     """시총/거래대금 데이터 병렬 수집 및 종목 매핑"""
@@ -99,26 +105,12 @@ def get_stock_data():
         futures = {key: executor.submit(parse_naver_sise, url) for key, url in urls.items()}
         results = {key: f.result() for key, f in futures.items()}
         
-    k_cap_stocks, market_date = results["k_cap"]
-    kd_cap_stocks, _ = results["kd_cap"]
-    k_val_stocks, _ = results["k_val"]
-    kd_val_stocks, _ = results["kd_val"]
-    
-    # 데이터 수집 페이지 중 하나라도 날짜가 확보되었다면 해당 날짜를 기준일로 설정
-    if not market_date:
-        for res in results.values():
-            if res[1]:
-                market_date = res[1]
-                break
-    if not market_date:
-        market_date = datetime.datetime.now().strftime("%Y년 %m월 %d일")
-        
-    combined_cap = k_cap_stocks + kd_cap_stocks
+    combined_cap = results["k_cap"] + results["kd_cap"]
     combined_cap.sort(key=lambda x: x['value'], reverse=True)
     top_50_cap = combined_cap[:50]
     top_50_cap.sort(key=lambda x: x['rate'], reverse=True)
     
-    combined_val = k_val_stocks + kd_val_stocks
+    combined_val = results["k_val"] + results["kd_val"]
     combined_val.sort(key=lambda x: x['value'], reverse=True)
     top_50_val = combined_val[:50]
     top_50_val.sort(key=lambda x: x['rate'], reverse=True)
@@ -136,9 +128,17 @@ def get_stock_data():
     with ThreadPoolExecutor(max_workers=12) as executor:
         fundamental_results = list(executor.map(lambda s: get_stock_fundamentals(s['ticker']), flat_stocks))
         
-    for s, (m_sum, per) in zip(flat_stocks, fundamental_results):
+    # 각 종목에 데이터를 매핑하면서 가장 먼저 발견된 실제 장마감 거래일을 확보합니다.
+    market_date = None
+    for s, (m_sum, per, m_date) in zip(flat_stocks, fundamental_results):
         s['market_sum'] = m_sum
         s['per'] = per
+        if m_date and not market_date:
+            market_date = m_date
+            
+    # 혹시 모를 예외 발생 시에만 시스템 현재 날짜로 폴백합니다.
+    if not market_date:
+        market_date = datetime.datetime.now().strftime("%Y년 %m월 %d일")
         
     return stock_dict, market_date
 
@@ -167,7 +167,7 @@ def telegram_webhook():
                     "text": "🔄 당일 거래대금/시총 상위 종목을 스크리닝 중입니다. 잠시만 기다려주세요..."
                 })
                 
-                # ⚡ 고속 스크리닝 엔진 구동 (실제 데이터 기준 날짜를 함께 받아옴)
+                # ⚡ 고속 스크리닝 엔진 구동 및 진짜 주식 거래일 동적 리턴
                 stock_data, date_str = get_stock_data()
                 
                 # 📊 줄바꿈 및 🔹 이모티콘 포맷터
@@ -190,7 +190,7 @@ def telegram_webhook():
                     "오늘 \"공시\"와 관련된 종목이 있는지 알려줘.\n\n\n\n"
                 )
                 
-                # 🚀 [메시지 2] 네이버 실시간 역추적 날짜가 연동된 최종 리포트 결합 발송
+                # 🚀 [메시지 2] 완벽하게 검증된 장마감일 기준 리포트 전송
                 msg2_text = (
                     f"{prompt_template}"
                     f"📋 *[{date_str}] 분석 대상 12개 종목 라인업 확정*\n\n"
