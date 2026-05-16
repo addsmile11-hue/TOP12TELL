@@ -12,92 +12,38 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 PROCESSED_UPDATES = []
 
 
-# ============================================================
-# 📅 영업일(거래일) 계산 모듈 - 새로 추가된 부분
-# ============================================================
-
-# 2026년 한국 증시 휴장일 (필요시 매년 갱신)
-KRX_HOLIDAYS_2026 = {
-    datetime.date(2026, 1, 1),   # 신정
-    datetime.date(2026, 2, 16),  # 설 대체
-    datetime.date(2026, 2, 17),  # 설
-    datetime.date(2026, 2, 18),  # 설
-    datetime.date(2026, 3, 1),   # 삼일절 (일)
-    datetime.date(2026, 3, 2),   # 삼일절 대체
-    datetime.date(2026, 5, 5),   # 어린이날
-    datetime.date(2026, 5, 25),  # 부처님오신날
-    datetime.date(2026, 6, 3),   # 지방선거
-    datetime.date(2026, 6, 6),   # 현충일 (토)
-    datetime.date(2026, 8, 15),  # 광복절 (토)
-    datetime.date(2026, 9, 24),  # 추석
-    datetime.date(2026, 9, 25),  # 추석
-    datetime.date(2026, 9, 26),  # 추석 (토)
-    datetime.date(2026, 10, 3),  # 개천절 (토)
-    datetime.date(2026, 10, 9),  # 한글날
-    datetime.date(2026, 12, 25), # 크리스마스
-    datetime.date(2026, 12, 31), # 연말 휴장
-}
-
-KRX_HOLIDAYS_2025 = {
-    datetime.date(2025, 1, 1),
-    datetime.date(2025, 1, 28),
-    datetime.date(2025, 1, 29),
-    datetime.date(2025, 1, 30),
-    datetime.date(2025, 3, 3),
-    datetime.date(2025, 5, 5),
-    datetime.date(2025, 5, 6),
-    datetime.date(2025, 6, 6),
-    datetime.date(2025, 8, 15),
-    datetime.date(2025, 10, 3),
-    datetime.date(2025, 10, 6),
-    datetime.date(2025, 10, 7),
-    datetime.date(2025, 10, 8),
-    datetime.date(2025, 10, 9),
-    datetime.date(2025, 12, 25),
-    datetime.date(2025, 12, 31),
-}
-
-ALL_KRX_HOLIDAYS = KRX_HOLIDAYS_2025 | KRX_HOLIDAYS_2026
-
-
-def get_last_trading_day(now=None):
+def get_last_trading_date():
     """
-    현재 시각 기준 '시세 페이지가 보여주는 데이터의 거래일'을 계산.
-    - 평일 장 마감(15:30) 이전이면 직전 영업일
-    - 평일 장 마감 이후면 당일
-    - 주말/공휴일이면 직전 영업일
+    삼성전자(005930) 종목 페이지에서 실제 표시 중인 마지막 거래일을 가져온다.
+    네이버는 종목 상세 페이지 상단의 em.date 영역에 'YYYY.MM.DD HH:MM 장마감' 형태로 거래일을 명시함.
     """
-    if now is None:
-        now = datetime.datetime.now()
-    
-    today = now.date()
-    # 평일이고 15:30 이전이면 아직 당일 데이터가 없음 → 직전 영업일
-    if today.weekday() < 5 and today not in ALL_KRX_HOLIDAYS:
-        if now.hour < 15 or (now.hour == 15 and now.minute < 30):
-            candidate = today - datetime.timedelta(days=1)
-        else:
-            candidate = today
-    else:
-        candidate = today
-    
-    # 주말/공휴일이면 영업일을 만날 때까지 하루씩 되돌림
-    while candidate.weekday() >= 5 or candidate in ALL_KRX_HOLIDAYS:
-        candidate -= datetime.timedelta(days=1)
-    
-    return candidate
+    url = "https://finance.naver.com/item/main.naver?code=005930"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    try:
+        res = requests.get(url, headers=headers, timeout=5)
+        res.encoding = 'utf-8'
+        soup = BeautifulSoup(res.text, 'html.parser')
 
+        date_elem = soup.select_one('em.date')
+        if date_elem:
+            text = date_elem.get_text(strip=True)
+            m = re.search(r'(\d{4})\.(\d{2})\.(\d{2})', text)
+            if m:
+                y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                dt = datetime.date(y, mo, d)
+                days = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"]
+                return f"{y}년 {mo:02d}월 {d:02d}일 {days[dt.weekday()]}"
+    except Exception:
+        pass
 
-def format_trading_day(d):
+    # 실패 시 오늘 날짜로 폴백
+    today = datetime.date.today()
     days = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"]
-    return f"{d.year}년 {d.month:02d}월 {d.day:02d}일 {days[d.weekday()]}"
+    return f"{today.year}년 {today.month:02d}월 {today.day:02d}일 {days[today.weekday()]}"
 
-
-# ============================================================
-# 시세 파싱 - 날짜 추출 로직 제거 (영업일 계산으로 대체)
-# ============================================================
 
 def parse_naver_sise(url):
-    """네이버 금융 시세 페이지 파싱 (날짜 추출은 더 이상 여기서 하지 않음)"""
+    """네이버 금융 시세 페이지 파싱 (날짜 추출 로직 제거)"""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
         res = requests.get(url, headers=headers, timeout=5)
@@ -179,12 +125,12 @@ def get_stock_data():
         "kd_val": "https://finance.naver.com/sise/sise_quant.naver?rankingType=deal_value&sosok=1"
     }
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    # 거래일 조회와 시세 4종을 함께 병렬 처리
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        date_future = executor.submit(get_last_trading_date)
         futures = {key: executor.submit(parse_naver_sise, url) for key, url in urls.items()}
         results = {key: f.result() for key, f in futures.items()}
-
-    # ✅ 날짜는 영업일 계산기로 결정 (페이지 텍스트에 의존 X)
-    final_date = format_trading_day(get_last_trading_day())
+        final_date = date_future.result()
 
     combined_cap = results["k_cap"] + results["kd_cap"]
     combined_cap.sort(key=lambda x: x['value'], reverse=True)
