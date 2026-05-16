@@ -49,7 +49,7 @@ def parse_naver_sise(url):
         return []
 
 def get_stock_fundamentals(ticker):
-    """개별 종목 상세 페이지 파싱 (인코딩 UTF-8 대응 완료)"""
+    """개별 종목 상세 페이지 파싱 (시가총액 띄어쓰기 결합 완료)"""
     url = f"https://finance.naver.com/item/main.naver?code={ticker}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
@@ -153,10 +153,10 @@ def telegram_webhook():
                 # ⚡ 고속 스크리닝 엔진 구동
                 stock_data = get_stock_data()
                 
-                # 📅 분석 기준일 자동 생성
+                # 📅 오늘 날짜 동적 확보
                 date_str = datetime.datetime.now().strftime("%Y년 %m월 %d일")
                 
-                # 📊 [시인성 패치] 🔹 이모티콘 및 종목명 마크다운 굵은 글씨(*) 일괄 적용
+                # 📊 줄바꿈 및 🔹 이모티콘 포맷터
                 def make_formatted_lines(stocks):
                     lines = []
                     for s in stocks:
@@ -168,8 +168,17 @@ def telegram_webhook():
                 val_up_str = make_formatted_lines(stock_data["trading_volume"]["up"])
                 val_down_str = make_formatted_lines(stock_data["trading_volume"]["down"])
                 
-                # 🚀 [메시지 2] 요구하신 완벽한 서식의 리포트 발송
+                # ✍️ 다른 LLM 검색용 프롬프트 질문 상단 템플릿 정의 (빈 줄 3개 확보)
+                prompt_template = (
+                    "아래 12개의 종목에서 \n"
+                    "오늘 실적발표가 있었던 종목이 있는지 알려줘. \n"
+                    "오늘 \"최초\"와 관련된 종목이 있는지 알려줘. \n"
+                    "오늘 \"공시\"와 관련된 종목이 있는지 알려줘.\n\n\n\n"
+                )
+                
+                # 🚀 [메시지 2] 프롬프트 템플릿과 12개 정렬 라인업을 단 하나의 메시지로 결합 전송
                 msg2_text = (
+                    f"{prompt_template}"
                     f"📋 *[{date_str}] 분석 대상 12개 종목 라인업 확정*\n\n"
                     "🏛️ *시가총액 상위 50위 그룹*\n\n"
                     f"• 📈 상승 Top 3\n\n{cap_up_str}\n\n"
