@@ -12,6 +12,9 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 genai.configure(api_key=GEMINI_API_KEY)
 
+# 텔레그램의 성급한 중복 재요청(Retry)을 기억하고 차단하기 위한 글로벌 저장소
+PROCESSED_UPDATES = []
+
 def parse_naver_sise(url):
     """네이버 금융 시세 테이블을 정밀 타겟팅하여 종목 데이터를 파싱합니다."""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -34,11 +37,9 @@ def parse_naver_sise(url):
             name = a_tag.get_text(strip=True)
             ticker = re.search(r'code=(\d+)', a_tag.get('href', '')).group(1)
             
-            # 등락률 추출
             rate_text = tds[4].get_text(strip=True).replace('%', '').replace('+', '').strip()
             rate = float(rate_text) if rate_text and rate_text != '0.00' else 0.0
             
-            # 정렬 기준값 (시가총액 또는 거래대금 액수)
             val_text = tds[6].get_text(strip=True).replace(',', '')
             val = float(val_text) if val_text else 0.0
             
@@ -48,32 +49,34 @@ def parse_naver_sise(url):
         return []
 
 def get_stock_data():
-    """시총 및 거래대금 상위 50위를 추출하고 각각 상하위 3개 종목을 매핑합니다."""
-    # 1. 시가총액 데이터 수집 및 랭킹 (코스피 + 코스닥 통합)
-    k_cap = parse_naver_sise("https://finance.naver.com/sise/sise_market_sum.naver?sosok=0&page=1")
-    kd_cap = parse_naver_sise("https://finance.naver.com/sise/sise_market_sum.naver?sosok=1&page=1")
-    combined_cap = k_cap + kd_cap
+    """4개의 네이버 시세 페이지를 동시에(병렬) 긁어와 시간을 1/4로 단축합니다."""
+    urls = {
+        "k_cap": "https://finance.naver.com/sise/sise_market_sum.naver?sosok=0&page=1",
+        "kd_cap": "https://finance.naver.com/sise/sise_market_sum.naver?sosok=1&page=1",
+        "k_val": "https://finance.naver.com/sise/sise_value_deal.naver?sosok=0",
+        "kd_val": "https://finance.naver.com/sise/sise_value_deal.naver?sosok=1"
+    }
+    
+    # 4개의 주소를 4명의 일꾼에게 각각 맡겨 동시에 처리
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {key: executor.submit(parse_naver_sise, url) for key, url in urls.items()}
+        results = {key: f.result() for key, f in futures.items()}
+        
+    # 1. 시가총액 상위 50위 통합 및 정렬
+    combined_cap = results["k_cap"] + results["kd_cap"]
     combined_cap.sort(key=lambda x: x['value'], reverse=True)
     top_50_cap = combined_cap[:50]
-    
     top_50_cap.sort(key=lambda x: x['rate'], reverse=True)
-    cap_up = top_50_cap[:3]
-    cap_down = list(reversed(top_50_cap[-3:]))
     
-    # 2. 거래대금 데이터 수집 및 랭킹 (코스피 + 코스닥 통합)
-    k_val = parse_naver_sise("https://finance.naver.com/sise/sise_value_deal.naver?sosok=0")
-    kd_val = parse_naver_sise("https://finance.naver.com/sise/sise_value_deal.naver?sosok=1")
-    combined_val = k_val + kd_val
+    # 2. 거래대금 상위 50위 통합 및 정렬
+    combined_val = results["k_val"] + results["kd_val"]
     combined_val.sort(key=lambda x: x['value'], reverse=True)
     top_50_val = combined_val[:50]
-    
     top_50_val.sort(key=lambda x: x['rate'], reverse=True)
-    val_up = top_50_val[:3]
-    val_down = list(reversed(top_50_val[-3:]))
     
     return {
-        "market_cap": {"up": cap_up, "down": cap_down},
-        "trading_volume": {"up": val_up, "down": val_down}
+        "market_cap": {"up": top_50_cap[:3], "down": list(reversed(top_50_cap[-3:]))},
+        "trading_volume": {"up": top_50_val[:3], "down": list(reversed(top_50_val[-3:]))}
     }
 
 def get_naver_finance_news(stock_info):
@@ -131,7 +134,7 @@ def run_main_pipeline():
     system_instruction = """
     당신은 대한민국 주식 시장의 트렌드 변화와 주도 섹터를 포착하는 전문 기관 투자자(프로 트레이더)이자 금융 분석가입니다.
     [Analysis Criteria]
-    1. 상승 종목 분석 시: 단순 테마성 순환매인지, 실적 어닝 서프라이즈, 핵심 수주 등 연속성이 있는 '새로운 논리'의 등장인지를 명확히 구분하세요.
+    1. 상승 종목 분석 시: 단순 테마성 순환매인지, 실적 어닝 서프라이즈, 핵심 수주 등 연속성이 있는 '새로운 논리'인지 명확히 구분하세요.
     2. 하락 종목 분석 시: 고점 차익실현인지, 펀더멘털 훼손 같은 '구조적 악재'인지 판단하세요.
     3. 미사여구는 절대 생략하고 팩트 위주로 극도로 압축하세요.
     [Output Format]을 엄격히 준수하여 12개 종목 모두 출력하세요. 종목당 핵심 요약은 최대 2줄 제한입니다.
@@ -145,23 +148,34 @@ def run_main_pipeline():
 
 @app.route('/', methods=['POST', 'GET'])
 def telegram_webhook():
+    global PROCESSED_UPDATES
     if request.method == 'POST':
         update = request.get_json()
+        
+        # 중복 요청 강제 차단 필터 고리
+        update_id = update.get("update_id")
+        if update_id:
+            if update_id in PROCESSED_UPDATES:
+                return jsonify({"status": "ignored_duplicate"})  # 이미 처리 중인 중복 메시지면 즉시 종료
+            PROCESSED_UPDATES.append(update_id)
+            if len(PROCESSED_UPDATES) > 50:  # 메모리 관리를 위해 최근 50개만 유지
+                PROCESSED_UPDATES.pop(0)
+
         if "message" in update and "text" in update["message"]:
             text = update["message"]["text"]
             chat_id = update["message"]["chat"]["id"]
             
             if text == '/check':
-                # 사용자의 요청에 즉시 반응하여 안내 문구 선발송
+                # 1. 즉시 첫 안내 멘트 발송 (사용자 대기감 해소)
                 requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
                     "chat_id": chat_id, 
-                    "text": "🔄 당일 거래대금/시총 상위 종목을 스크리닝하고 최신 뉴스 플로우를 분석 중입니다. 약 5~8초 정도 소요됩니다..."
+                    "text": "🔄 당일 거래대금/시총 상위 종목을 스크리닝하고 최신 뉴스 플로우를 분석 중입니다. 잠시만 기다려주세요..."
                 })
                 
-                # 가볍고 빨라진 분석 엔진 구동
+                # 2. 극도로 빨라진 병렬 분석 파이프라인 가동
                 analysis_result = run_main_pipeline()
                 
-                # 리포트 결과 발송
+                # 3. 리포트 결과 최종 발송
                 requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
                     "chat_id": chat_id,
                     "text": analysis_result,
