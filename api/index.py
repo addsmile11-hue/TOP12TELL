@@ -117,3 +117,83 @@ def run_main_pipeline(data):
     input_data_for_llm = ""
     current_group, current_dir = "", ""
     for s_info, news_text, direction, group in results:
+        if current_group != group:
+            current_group = group
+            input_data_for_llm += f"\n## 🏆 [{current_group}] 등락률 Top 3\n"
+        dir_title = "📈 상승 Top 3" if direction == "up" else "📉 하락 Top 3"
+        if current_dir != dir_title:
+            current_dir = dir_title
+            input_data_for_llm += f"### {current_dir}\n"
+        input_data_for_llm += f"- {s_info['name']} ({s_info['rate']}%)\n{news_text}\n"
+
+    system_instruction = """
+    당신은 대한민국 주식 시장의 트렌드 변화와 주도 섹터를 포착하는 전문 기관 투자자(프로 트레이더)이자 금융 분석가입니다.
+    [Analysis Criteria]
+    1. 상승 종목 분석 시: 단순 테마성 순환매인지, 실적 어닝 서프라이즈, 핵심 수주 등 연속성이 있는 '새로운 논리'인지 명확히 구분하세요.
+    2. 하락 종목 분석 시: 고점 차익실현인지, 펀더멘털 훼손 같은 '구조적 악재'인지 판단하세요.
+    3. 미사여구는 절대 생략하고 팩트 위주로 극도로 압축하세요.
+    [Output Format]을 엄격히 준수하여 12개 종목 모두 출력하세요. 종목당 핵심 요약은 최대 2줄 제한입니다.
+    """
+    try:
+        model = genai.GenerativeModel(model_name="gemini-1.5-flash", system_instruction=system_instruction)
+        response = model.generate_content(f"[Input Data]\n{input_data_for_llm}", generation_config={"temperature": 0.2})
+        return response.text
+    except Exception as e:
+        return f"⚠️ 제미나이 AI 분석 처리 중 오류가 발생했습니다: {str(e)}"
+
+@app.route('/', methods=['POST', 'GET'])
+def telegram_webhook():
+    global PROCESSED_UPDATES
+    if request.method == 'POST':
+        update = request.get_json()
+        
+        update_id = update.get("update_id")
+        if update_id:
+            if update_id in PROCESSED_UPDATES:
+                return jsonify({"status": "ignored_duplicate"})
+            PROCESSED_UPDATES.append(update_id)
+            if len(PROCESSED_UPDATES) > 50:
+                PROCESSED_UPDATES.pop(0)
+
+        if "message" in update and "text" in update["message"]:
+            text = update["message"]["text"]
+            chat_id = update["message"]["chat"]["id"]
+            
+            if text == '/check':
+                # 🚀 [메시지 1] 즉시 대기 안내 텍스트 발송
+                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
+                    "chat_id": chat_id, 
+                    "text": "🔄 당일 거래대금/시총 상위 종목을 스크리닝 중입니다. 잠시만 기다려주세요..."
+                })
+                
+                # ⚡ 1차 고속 데이터 스크리닝 실행 (약 1초)
+                stock_data = get_stock_data()
+                
+                # 🚀 [메시지 2] 발굴된 12개 분석 대상 종목 라인업 빠르게 우선 전송
+                msg2_text = (
+                    "📋 *오늘의 분석 대상 12개 종목 라인업 확정*\n\n"
+                    "🏛️ *시가총액 상위 50위 그룹*\n"
+                    f"• 📈 상승 Top 3: " + ", ".join([f"*{s['name']}* ({s['rate']}%)\n" for s in stock_data["market_cap"]["up"]]) + 
+                    f"• 📉 하락 Top 3: " + ", ".join([f"*{s['name']}* ({s['rate']}%)\n" for s in stock_data["market_cap"]["down"]]) + "\n"
+                    "💸 *거래대금 상위 50위 그룹*\n"
+                    f"• 📈 상승 Top 3: " + ", ".join([f"*{s['name']}* ({s['rate']}%)\n" for s in stock_data["trading_volume"]["up"]]) + 
+                    f"• 📉 하락 Top 3: " + ", ".join([f"*{s['name']}* ({s['rate']}%)\n" for s in stock_data["trading_volume"]["down"]]) + "\n"
+                    "⏳ 제미나이 AI가 위 종목들의 뉴스 플로우와 주도주 내러티브를 정밀 분석하고 있습니다..."
+                )
+                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
+                    "chat_id": chat_id,
+                    "text": msg2_text,
+                    "parse_mode": "Markdown"
+                })
+                
+                # ⚡ 2차 뉴스 긁기 및 제미나이 무거운 연산 처리 (약 4~5초)
+                analysis_result = run_main_pipeline(stock_data)
+                
+                # 🚀 [메시지 3] 최종 주도주 모멘텀 분석 리포트 발송
+                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
+                    "chat_id": chat_id,
+                    "text": analysis_result,
+                    "parse_mode": "Markdown"
+                })
+        return jsonify({"status": "success"})
+    return "Stock Leader Analysis Bot Engine is running!"
