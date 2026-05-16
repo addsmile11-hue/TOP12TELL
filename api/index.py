@@ -11,7 +11,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 PROCESSED_UPDATES = []
 
 def parse_naver_sise(url):
-    """네이버 금융 시세 테이블 범용 파싱"""
+    """네이버 금융 시세 메뉴 페이지 파싱 (EUC-KR 유지)"""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
         res = requests.get(url, headers=headers, timeout=5)
@@ -48,30 +48,33 @@ def parse_naver_sise(url):
         return []
 
 def get_stock_fundamentals(ticker):
-    """개별 종목 페이지에서 시가총액과 PER 지표를 실시간으로 추출합니다."""
+    """개별 종목 상세 페이지 파싱 (근본 원인 해결: 네이버 상세페이지의 UTF-8 변환 대응)"""
     url = f"https://finance.naver.com/item/main.naver?code={ticker}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
         res = requests.get(url, headers=headers, timeout=3)
-        res.encoding = 'euc-kr'
+        # 인코딩 설정을 생략하거나 utf-8로 두어 글자 깨짐(議 버그)을 완벽하게 방지합니다.
+        res.encoding = 'utf-8' 
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        # 1. 시가총액 추출 및 포맷팅
+        # 1. 시가총액 추출
         market_sum_elem = soup.select_one('#_market_sum')
         if market_sum_elem:
             market_sum = market_sum_elem.get_text(strip=True)
-            market_sum = re.sub(r'\s+', ' ', market_sum) + "억"
+            market_sum = re.sub(r'\s+', ' ', market_sum)
+            if not market_sum.endswith('억'):
+                market_sum += '억'
         else:
             market_sum = "N/A"
             
-        # 2. 추정 PER 추출 (추정 PER이 없으면 일반 PER로 대체)
-        per_elem = soup.select_one('#_cper')  # 추정PER
-        if not per_elem or not per_elem.get_text(strip=True) or per_elem.get_text(strip=True) == '-':
-            per_elem = soup.select_one('#_per')   # 일반PER
+        # 2. 추정 PER 또는 일반 PER 추출
+        per_elem = soup.select_one('#_cper')  # 추정PER 조준
+        if not per_elem or not per_elem.get_text(strip=True) or per_elem.get_text(strip=True).strip() == '-':
+            per_elem = soup.select_one('#_per')   # 일반PER 대체 조준
             
         if per_elem:
-            per = per_elem.get_text(strip=True)
-            per = "N/A" if per == '-' else per
+            per = per_elem.get_text(strip=True).strip()
+            per = "N/A" if per == '-' or not per else per
         else:
             per = "N/A"
             
@@ -80,7 +83,7 @@ def get_stock_fundamentals(ticker):
         return "N/A", "N/A"
 
 def get_stock_data():
-    """시총 및 거래대금 상위 50위 페이지 수집 및 랭킹 산정"""
+    """시총/거래대금 데이터 병렬 수집 및 종목 매핑"""
     urls = {
         "k_cap": "https://finance.naver.com/sise/sise_market_sum.naver?sosok=0&page=1",
         "kd_cap": "https://finance.naver.com/sise/sise_market_sum.naver?sosok=1&page=1",
@@ -107,7 +110,6 @@ def get_stock_data():
         "trading_volume": {"up": top_50_val[:3], "down": list(reversed(top_50_val[-3:]))}
     }
     
-    # 랭킹 완료 후, 12개 종목의 펀더멘털 데이터를 멀티스레딩으로 동시 수집
     flat_stocks = []
     for group in ["market_cap", "trading_volume"]:
         for direction in ["up", "down"]:
@@ -147,19 +149,22 @@ def telegram_webhook():
                     "text": "🔄 당일 거래대금/시총 상위 종목을 스크리닝 중입니다. 잠시만 기다려주세요..."
                 })
                 
-                # ⚡ 고속 데이터 스크리닝 + 펀더멘털 수집 실행 (약 0.5초)
+                # ⚡ 고속 스크리닝 엔진 구동
                 stock_data = get_stock_data()
                 
-                # 📊 요청하신 줄바꿈 및 지표 대괄호 양식 조립
+                # 📊 요청하신 형태 그대로 줄바꿈 배치 포맷팅 생성 (대괄호 제거 및 가독성 확보)
                 def make_formatted_lines(stocks):
-                    return "\n".join([f"{s['name']} ({s['rate']}%) [시가총액 {s['market_sum']}] [추정PER {s['per']}]" for s in stocks])
+                    lines = []
+                    for s in stocks:
+                        lines.append(f"{s['name']} ({s['rate']}%)\n시가총액 {s['market_sum']} 추정 PER {s['per']}\n")
+                    return "\n".join(lines).strip()
                 
                 cap_up_str = make_formatted_lines(stock_data["market_cap"]["up"])
                 cap_down_str = make_formatted_lines(stock_data["market_cap"]["down"])
                 val_up_str = make_formatted_lines(stock_data["trading_volume"]["up"])
                 val_down_str = make_formatted_lines(stock_data["trading_volume"]["down"])
                 
-                # 🚀 [메시지 2] 요구사항이 100% 반영된 최종 브리핑 리포트 발송
+                # 🚀 [메시지 2] 완벽하게 가공된 12개 최종 라인업 리포트 전송
                 msg2_text = (
                     "📋 *오늘의 분석 대상 12개 종목 라인업 확정*\n\n"
                     "🏛️ *시가총액 상위 50위 그룹*\n\n"
