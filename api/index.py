@@ -16,7 +16,7 @@ genai.configure(api_key=GEMINI_API_KEY)
 PROCESSED_UPDATES = []
 
 def parse_naver_sise(url):
-    """네이버 금융 시세 테이블 파싱"""
+    """네이버 금융 시세 테이블 범용 파싱 (클래스 필터 제거로 버그 원천 차단)"""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
         res = requests.get(url, headers=headers, timeout=5)
@@ -25,17 +25,20 @@ def parse_naver_sise(url):
         table = soup.select_one('table.type_2')
         if not table: return []
         
-        rows = table.select('tbody > tr')
+        rows = table.select('tr')
         stocks = []
         for row in rows:
             tds = row.select('td')
             if len(tds) < 7: continue
             
-            a_tag = tds[1].select_one('a.tltle')
-            if not a_tag: continue
+            # [버셀 버그 수정] .tltle 클래스 제약을 없애고 td 안의 첫 번째 a 태그를 바로 조준합니다.
+            a_tag = tds[1].select_one('a')
+            if not a_tag or 'href' not in a_tag.attrs: continue
             
             name = a_tag.get_text(strip=True)
-            ticker = re.search(r'code=(\d+)', a_tag.get('href', '')).group(1)
+            ticker_match = re.search(r'code=(\d+)', a_tag.get('href', ''))
+            if not ticker_match: continue
+            ticker = ticker_match.group(1)
             
             rate_text = tds[4].get_text(strip=True).replace('%', '').replace('+', '').strip()
             rate = float(rate_text) if rate_text and rate_text != '0.00' else 0.0
@@ -166,18 +169,18 @@ def telegram_webhook():
                     "text": "🔄 당일 거래대금/시총 상위 종목을 스크리닝 중입니다. 잠시만 기다려주세요..."
                 })
                 
-                # ⚡ 1차 고속 데이터 스크리닝 실행 (약 1초)
+                # ⚡ 1차 고속 데이터 스크리닝 실행
                 stock_data = get_stock_data()
                 
-                # 🚀 [메시지 2] 발굴된 12개 분석 대상 종목 라인업 빠르게 우선 전송
+                # 🚀 [메시지 2] 발굴된 12개 분석 대상 종목 라인업 가독성 업그레이드 버전 발송
                 msg2_text = (
                     "📋 *오늘의 분석 대상 12개 종목 라인업 확정*\n\n"
                     "🏛️ *시가총액 상위 50위 그룹*\n"
-                    f"• 📈 상승 Top 3: " + ", ".join([f"*{s['name']}* ({s['rate']}%)\n" for s in stock_data["market_cap"]["up"]]) + 
-                    f"• 📉 하락 Top 3: " + ", ".join([f"*{s['name']}* ({s['rate']}%)\n" for s in stock_data["market_cap"]["down"]]) + "\n"
+                    f"• 📈 상승 Top 3: " + ", ".join([f"*{s['name']}* ({s['rate']}%)" for s in stock_data["market_cap"]["up"]]) + "\n"
+                    f"• 📉 하락 Top 3: " + ", ".join([f"*{s['name']}* ({s['rate']}%)" for s in stock_data["market_cap"]["down"]]) + "\n\n"
                     "💸 *거래대금 상위 50위 그룹*\n"
-                    f"• 📈 상승 Top 3: " + ", ".join([f"*{s['name']}* ({s['rate']}%)\n" for s in stock_data["trading_volume"]["up"]]) + 
-                    f"• 📉 하락 Top 3: " + ", ".join([f"*{s['name']}* ({s['rate']}%)\n" for s in stock_data["trading_volume"]["down"]]) + "\n"
+                    f"• 📈 상승 Top 3: " + ", ".join([f"*{s['name']}* ({s['rate']}%)" for s in stock_data["trading_volume"]["up"]]) + "\n"
+                    f"• 📉 하락 Top 3: " + ", ".join([f"*{s['name']}* ({s['rate']}%)" for s in stock_data["trading_volume"]["down"]]) + "\n\n"
                     "⏳ 제미나이 AI가 위 종목들의 뉴스 플로우와 주도주 내러티브를 정밀 분석하고 있습니다..."
                 )
                 requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
@@ -186,7 +189,7 @@ def telegram_webhook():
                     "parse_mode": "Markdown"
                 })
                 
-                # ⚡ 2차 뉴스 긁기 및 제미나이 무거운 연산 처리 (약 4~5초)
+                # ⚡ 2차 뉴스 긁기 및 제미나이 연산 처리
                 analysis_result = run_main_pipeline(stock_data)
                 
                 # 🚀 [메시지 3] 최종 주도주 모멘텀 분석 리포트 발송
