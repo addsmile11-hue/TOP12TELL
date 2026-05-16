@@ -49,7 +49,7 @@ def parse_naver_sise(url):
         return []
 
 def get_stock_fundamentals(ticker):
-    """개별 종목 상세 페이지 파싱 (시가총액 띄어쓰기 버그 수정)"""
+    """개별 종목 상세 페이지 파싱 (인코딩 UTF-8 대응 완료)"""
     url = f"https://finance.naver.com/item/main.naver?code={ticker}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     try:
@@ -57,12 +57,12 @@ def get_stock_fundamentals(ticker):
         res.encoding = 'utf-8' 
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        # 1. 시가총액 추출 및 '조' 뒤의 공백 강제 제거 (39조 1,738억 -> 39조1,738억)
+        # 1. 시가총액 추출 및 공백 제거
         market_sum_elem = soup.select_one('#_market_sum')
         if market_sum_elem:
             market_sum = market_sum_elem.get_text(strip=True)
             market_sum = re.sub(r'\s+', ' ', market_sum)
-            market_sum = market_sum.replace('조 ', '조') # 조 뒤의 공백 제거 규칙
+            market_sum = market_sum.replace('조 ', '조')
             if not market_sum.endswith('억'):
                 market_sum += '억'
         else:
@@ -84,7 +84,7 @@ def get_stock_fundamentals(ticker):
         return "N/A", "N/A"
 
 def get_stock_data():
-    """시총/거래대금 데이터 병렬 수집 및 종목 매핑"""
+    """시총/거래대금 데이터 병렬 수집 및 랭킹 정렬"""
     urls = {
         "k_cap": "https://finance.naver.com/sise/sise_market_sum.naver?sosok=0&page=1",
         "kd_cap": "https://finance.naver.com/sise/sise_market_sum.naver?sosok=1&page=1",
@@ -153,22 +153,22 @@ def telegram_webhook():
                 # ⚡ 고속 스크리닝 엔진 구동
                 stock_data = get_stock_data()
                 
-                # 📅 오늘 날짜 동적 확보 (예: 2026년 05월 17일)
+                # 📅 분석 기준일 자동 생성
                 date_str = datetime.datetime.now().strftime("%Y년 %m월 %d일")
                 
-                # 📊 종목 간 공백 라인을 완전히 없애고 타이트하게 밀착시키는 포맷터
+                # 📊 [시인성 패치] 🔹 이모티콘 및 종목명 마크다운 굵은 글씨(*) 일괄 적용
                 def make_formatted_lines(stocks):
                     lines = []
                     for s in stocks:
-                        lines.append(f"{s['name']} ({s['rate']}%)\n시가총액 {s['market_sum']} 추정 PER {s['per']}")
-                    return "\n".join(lines) # 종목 간 빈 줄 없이 단순 줄바꿈 연동
+                        lines.append(f"🔹 *{s['name']}* ({s['rate']}%)\n시가총액 {s['market_sum']} 추정 PER {s['per']}")
+                    return "\n".join(lines)
                 
                 cap_up_str = make_formatted_lines(stock_data["market_cap"]["up"])
                 cap_down_str = make_formatted_lines(stock_data["market_cap"]["down"])
                 val_up_str = make_formatted_lines(stock_data["trading_volume"]["up"])
                 val_down_str = make_formatted_lines(stock_data["trading_volume"]["down"])
                 
-                # 🚀 [메시지 2] 요구하신 인덱싱, 날짜, 여백 룰이 100% 적용된 완벽한 리포트 주입
+                # 🚀 [메시지 2] 요구하신 완벽한 서식의 리포트 발송
                 msg2_text = (
                     f"📋 *[{date_str}] 분석 대상 12개 종목 라인업 확정*\n\n"
                     "🏛️ *시가총액 상위 50위 그룹*\n\n"
