@@ -29,7 +29,7 @@ def get_last_trading_date():
 
 
 def parse_naver_sise(url):
-    """시세 페이지에서 종목 리스트 파싱"""
+    """시세 페이지에서 종목 리스트 파싱 (현재가도 같이 추출)"""
     try:
         table = fetch(url).select_one('table.type_2')
         if not table:
@@ -43,9 +43,11 @@ def parse_naver_sise(url):
             tm = re.search(r'code=(\d+)', a.get('href', '')) if a else None
             if not tm:
                 continue
+            price = float(re.sub(r'[^\d]', '', tds[2].get_text(strip=True)) or 0)
             rate = float(re.sub(r'[^\d\.-]', '', tds[4].get_text(strip=True)) or 0)
             val = float(re.sub(r'[^\d]', '', tds[6].get_text(strip=True)) or 0)
-            stocks.append({'ticker': tm.group(1), 'name': a.get_text(strip=True), 'rate': rate, 'value': val})
+            stocks.append({'ticker': tm.group(1), 'name': a.get_text(strip=True),
+                           'price': price, 'rate': rate, 'value': val})
         return stocks
     except Exception:
         return []
@@ -71,6 +73,34 @@ def get_stock_fundamentals(ticker):
         return "N/A", "N/A"
 
 
+def get_prev_month_close(ticker, current_price):
+    """
+    일별시세 페이지에서 지난달 마지막 거래일 종가를 찾아 월봉 상승률 계산.
+    일별시세는 최신순으로 정렬되어 있으므로, 이번 달이 아닌 첫 행이 지난달 말일 종가.
+    """
+    try:
+        today = datetime.date.today()
+        soup = fetch(f"https://finance.naver.com/item/sise_day.naver?code={ticker}&page=1", 'euc-kr', timeout=3)
+        for row in soup.select('table.type2 tr'):
+            tds = row.select('td')
+            if len(tds) < 2:
+                continue
+            date_text = tds[0].get_text(strip=True)
+            dm = re.match(r'(\d{4})\.(\d{2})\.(\d{2})', date_text)
+            if not dm:
+                continue
+            y, mo, d = map(int, dm.groups())
+            # 오늘이 속한 달이 아닌 첫 거래일 = 지난달 마지막 거래일
+            if (y, mo) != (today.year, today.month):
+                close = float(re.sub(r'[^\d]', '', tds[1].get_text(strip=True)) or 0)
+                if close and current_price:
+                    return round((current_price - close) / close * 100, 2)
+                return None
+        return None
+    except Exception:
+        return None
+
+
 def pick_top_bottom(stocks_a, stocks_b):
     """두 시장 합쳐 거래대금 상위 50 추출 후, 등락률 기준 상/하위 3개씩 반환"""
     combined = sorted(stocks_a + stocks_b, key=lambda x: x['value'], reverse=True)[:50]
@@ -86,7 +116,6 @@ def get_stock_data():
         "kd_val": "https://finance.naver.com/sise/sise_quant.naver?rankingType=deal_value&sosok=1",
     }
 
-    # 거래일 + 시세 4종 병렬 수집
     with ThreadPoolExecutor(max_workers=5) as ex:
         date_f = ex.submit(get_last_trading_date)
         r = {k: ex.submit(parse_naver_sise, u) for k, u in urls.items()}
@@ -99,9 +128,14 @@ def get_stock_data():
     }
 
     flat = [s for g in stock_dict.values() for d in g.values() for s in d]
+
+    # 펀더멘털 + 월봉 상승률 병렬 수집
     with ThreadPoolExecutor(max_workers=12) as ex:
-        for s, (ms, per) in zip(flat, ex.map(lambda x: get_stock_fundamentals(x['ticker']), flat)):
-            s['market_sum'], s['per'] = ms, per
+        funds = list(ex.map(lambda x: get_stock_fundamentals(x['ticker']), flat))
+        monthly = list(ex.map(lambda x: get_prev_month_close(x['ticker'], x['price']), flat))
+
+    for s, (ms, per), m_rate in zip(flat, funds, monthly):
+        s['market_sum'], s['per'], s['monthly_rate'] = ms, per, m_rate
 
     return stock_dict, final_date
 
@@ -114,7 +148,15 @@ def send_telegram(chat_id, text, markdown=False):
 
 
 def format_lines(stocks):
-    return "\n".join(f"🔹 *{s['name']}* ({s['rate']}%)\n시가총액 {s['market_sum']} 추정 PER {s['per']}" for s in stocks)
+    lines = []
+    for s in stocks:
+        m = s.get('monthly_rate')
+        m_str = f"{m:+.2f}%" if m is not None else "N/A"
+        lines.append(
+            f"🔹 *{s['name']}* ({s['rate']}%)\n"
+            f"시가총액 {s['market_sum']} 추정 PER {s['per']} | 월봉 {m_str}"
+        )
+    return "\n".join(lines)
 
 
 @app.route('/', methods=['POST', 'GET'])
