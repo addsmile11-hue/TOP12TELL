@@ -154,7 +154,7 @@ def format_lines(stocks):
         m_str = f"{m:+.2f}%" if m is not None else "N/A"
         lines.append(
             f"🔹 *{s['name']}* ({s['rate']}%)\n"
-            f"시가총액 {s['market_sum']} 추정 PER {s['per']} | 월봉 {m_str}"
+            f"Cap {s['market_sum']} f-PER {s['per']} MTD {m_str}"
         )
     return "\n".join(lines)
 
