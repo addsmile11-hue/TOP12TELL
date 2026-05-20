@@ -13,9 +13,6 @@ HEADERS = {
 DAYS = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"]
 PROCESSED_UPDATES = []
 
-# 디버그 모드: True로 두면 MTD 자리에 에러 원인을 노출
-DEBUG_MTD = True
-
 
 def fetch(url, encoding='euc-kr', timeout=5):
     res = requests.get(url, headers=HEADERS, timeout=timeout)
@@ -77,59 +74,73 @@ def get_stock_fundamentals(ticker):
 
 def get_prev_month_close(ticker, current_price):
     """
-    여러 데이터 소스를 fallback 체인으로 시도해서 MTD(당월 상승률)를 가져옴.
-    DEBUG_MTD=True인 경우 (mtd_value, debug_string)을 반환,
-    DEBUG_MTD=False인 경우 mtd_value만 반환.
+    MTD(당월 상승률) 계산.
+    
+    로직:
+    1. 네이버 siseJson API로 일봉 데이터 60일치 가져옴
+    2. None 값이 있는 행은 안전하게 건너뜀
+    3. 지난달 마지막 거래일 종가를 찾으면 그것 기준으로 계산
+    4. 지난달 거래일이 없으면 (신규 상장주) → 상장일(가장 오래된 데이터) 기준으로 계산
+    5. API 실패 시 HTML 페이지로 폴백
     """
-    debug_info = []
 
     # === 시도 1: 네이버 siseJson API ===
     try:
         today = datetime.date.today()
-        start = (today - datetime.timedelta(days=60)).strftime("%Y%m%d")
+        start = (today - datetime.timedelta(days=90)).strftime("%Y%m%d")
         end = today.strftime("%Y%m%d")
         url = (
             f"https://api.finance.naver.com/siseJson.naver?"
             f"symbol={ticker}&requestType=1&startTime={start}&endTime={end}&timeframe=day"
         )
         res = requests.get(url, headers=HEADERS, timeout=5)
-        debug_info.append(f"NV-API:{res.status_code}")
         text = res.text.strip()
-        
+
         if res.status_code == 200 and text and not text.startswith('Host'):
-            # 응답은 JS literal 형식 (작은따옴표 사용)
-            # JSON으로 변환: 작은따옴표 → 큰따옴표
             normalized = text.replace("'", '"')
             try:
                 data = json.loads(normalized)
-            except:
+            except Exception:
                 import ast
                 data = ast.literal_eval(text)
-            
+
             if data and len(data) >= 2:
                 rows = data[1:]
-                prev_close = None
+                prev_close = None        # 지난달 마지막 거래일 종가
+                first_valid_close = None # 가장 오래된 거래일 종가 (신규 상장주 대비)
+
                 for row in rows:
+                    # 안전한 값 추출 - None 또는 잘못된 데이터 건너뛰기
+                    if not row or len(row) < 5:
+                        continue
                     date_int = row[0]
                     close = row[4]
+                    if date_int is None or close is None:
+                        continue
+                    try:
+                        date_int = int(date_int)
+                        close = float(close)
+                    except (TypeError, ValueError):
+                        continue
+                    if close <= 0:
+                        continue
+
+                    if first_valid_close is None:
+                        first_valid_close = close
+
                     y = date_int // 10000
                     mo = (date_int // 100) % 100
                     if (y, mo) != (today.year, today.month):
                         prev_close = close
-                    else:
-                        break
-                if prev_close and current_price:
-                    rate = round((current_price - prev_close) / prev_close * 100, 2)
-                    return (rate, "NV-API") if DEBUG_MTD else rate
-                debug_info.append(f"no-prev(rows={len(rows)})")
-            else:
-                debug_info.append(f"empty-data")
-        else:
-            debug_info.append(f"body:{text[:30]}")
-    except Exception as e:
-        debug_info.append(f"NV-API-err:{type(e).__name__}")
 
-    # === 시도 2: 네이버 sise_day.naver HTML 페이지 (Referer 헤더 포함) ===
+                # 지난달 데이터가 있으면 그것 기준
+                base = prev_close if prev_close else first_valid_close
+                if base and current_price:
+                    return round((current_price - base) / base * 100, 2)
+    except Exception:
+        pass
+
+    # === 시도 2: 네이버 sise_day.naver HTML 페이지 ===
     try:
         today = datetime.date.today()
         url = f"https://finance.naver.com/item/sise_day.naver?code={ticker}&page=1"
@@ -137,11 +148,14 @@ def get_prev_month_close(ticker, current_price):
         headers["Referer"] = f"https://finance.naver.com/item/sise.naver?code={ticker}"
         res = requests.get(url, headers=headers, timeout=5)
         res.encoding = 'euc-kr'
-        debug_info.append(f"NV-HTML:{res.status_code}")
-        
+
         if res.status_code == 200:
             soup = BeautifulSoup(res.text, 'html.parser')
             rows = soup.select('table.type2 tr')
+
+            # HTML은 최신순(현재→과거)으로 정렬됨
+            # 모든 거래일 종가 수집 후, 지난달 마지막 거래일 또는 가장 오래된 거래일 사용
+            entries = []  # [(date_tuple, close), ...]
             for row in rows:
                 tds = row.select('td')
                 if len(tds) < 2:
@@ -151,56 +165,28 @@ def get_prev_month_close(ticker, current_price):
                 if not dm:
                     continue
                 y, mo, d = map(int, dm.groups())
-                if (y, mo) != (today.year, today.month):
-                    close = float(re.sub(r'[^\d]', '', tds[1].get_text(strip=True)) or 0)
-                    if close and current_price:
-                        rate = round((current_price - close) / close * 100, 2)
-                        return (rate, "NV-HTML") if DEBUG_MTD else rate
-                    break
-            debug_info.append(f"no-prev-html(rows={len(rows)})")
-    except Exception as e:
-        debug_info.append(f"NV-HTML-err:{type(e).__name__}")
+                close_text = tds[1].get_text(strip=True)
+                close = float(re.sub(r'[^\d]', '', close_text) or 0)
+                if close <= 0:
+                    continue
+                entries.append(((y, mo, d), close))
 
-    # === 시도 3: Yahoo Finance (한국 종목은 .KS 또는 .KQ) ===
-    try:
-        import time
-        today = datetime.date.today()
-        end_ts = int(time.mktime(today.timetuple()))
-        start_ts = int(time.mktime((today - datetime.timedelta(days=60)).timetuple()))
-        
-        for suffix in ['KS', 'KQ']:  # 코스피, 코스닥 둘 다 시도
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}.{suffix}?period1={start_ts}&period2={end_ts}&interval=1d"
-            try:
-                res = requests.get(url, headers=HEADERS, timeout=5)
-                if res.status_code != 200:
-                    continue
-                d = res.json()
-                if not d.get('chart', {}).get('result'):
-                    continue
-                result = d['chart']['result'][0]
-                timestamps = result.get('timestamp') or []
-                closes = result.get('indicators', {}).get('quote', [{}])[0].get('close') or []
-                
+            if entries:
+                # 지난달 마지막 거래일 찾기 (entries는 최신순이므로 첫 매칭이 정답)
                 prev_close = None
-                for ts, close in zip(timestamps, closes):
-                    if close is None:
-                        continue
-                    dt = datetime.date.fromtimestamp(ts)
-                    if (dt.year, dt.month) != (today.year, today.month):
+                for (y, mo, d), close in entries:
+                    if (y, mo) != (today.year, today.month):
                         prev_close = close
-                    else:
                         break
-                if prev_close and current_price:
-                    rate = round((current_price - prev_close) / prev_close * 100, 2)
-                    return (rate, f"YH-{suffix}") if DEBUG_MTD else rate
-            except Exception:
-                continue
-        debug_info.append("YH-fail")
-    except Exception as e:
-        debug_info.append(f"YH-err:{type(e).__name__}")
 
-    err_str = "|".join(debug_info)[:50]
-    return (None, err_str) if DEBUG_MTD else None
+                # 없으면 가장 오래된 거래일 (entries의 마지막 = 신규 상장주의 상장일)
+                base = prev_close if prev_close else entries[-1][1]
+                if base and current_price:
+                    return round((current_price - base) / base * 100, 2)
+    except Exception:
+        pass
+
+    return None
 
 
 def pick_top_bottom(stocks_a, stocks_b):
@@ -234,13 +220,8 @@ def get_stock_data():
         funds = list(ex.map(lambda x: get_stock_fundamentals(x['ticker']), flat))
         monthly = list(ex.map(lambda x: get_prev_month_close(x['ticker'], x['price']), flat))
 
-    for s, (ms, per), m_result in zip(flat, funds, monthly):
-        s['market_sum'], s['per'] = ms, per
-        if DEBUG_MTD:
-            s['monthly_rate'], s['mtd_debug'] = m_result
-        else:
-            s['monthly_rate'] = m_result
-            s['mtd_debug'] = None
+    for s, (ms, per), m_rate in zip(flat, funds, monthly):
+        s['market_sum'], s['per'], s['monthly_rate'] = ms, per, m_rate
 
     return stock_dict, final_date
 
@@ -256,12 +237,7 @@ def format_lines(stocks):
     lines = []
     for s in stocks:
         m = s.get('monthly_rate')
-        if m is not None:
-            m_str = f"{m:+.2f}%"
-        elif DEBUG_MTD and s.get('mtd_debug'):
-            m_str = f"N/A[{s['mtd_debug']}]"  # 디버그 정보 표시
-        else:
-            m_str = "N/A"
+        m_str = f"{m:+.2f}%" if m is not None else "N/A"
         lines.append(
             f"🔹 *{s['name']}* ({s['rate']}%)\n"
             f"Cap {s['market_sum']} f-PER {s['per']} MTD {m_str}"
@@ -272,7 +248,7 @@ def format_lines(stocks):
 @app.route('/', methods=['POST', 'GET'])
 def telegram_webhook():
     if request.method == 'GET':
-        return "Stock Leader Screening Engine is running! [v3-debug]"
+        return "Stock Leader Screening Engine is running!"
 
     update = request.get_json() or {}
     uid = update.get("update_id")
@@ -288,7 +264,7 @@ def telegram_webhook():
     chat_id = msg.get("chat", {}).get("id")
 
     if text == '/check' and chat_id:
-        send_telegram(chat_id, "🔄 당일 거래대금/시총 상위 종목을 스크리닝 중입니다. 잠시만 기다려주세요... [v3-debug]")
+        send_telegram(chat_id, "🔄 당일 거래대금/시총 상위 종목을 스크리닝 중입니다. 잠시만 기다려주세요...")
         data, date_str = get_stock_data()
 
         prompt = (
