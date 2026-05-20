@@ -5,13 +5,20 @@ from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+}
 DAYS = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"]
 PROCESSED_UPDATES = []
 
 
-def fetch(url, encoding='euc-kr', timeout=5):
-    res = requests.get(url, headers=HEADERS, timeout=timeout)
+def fetch(url, encoding='euc-kr', timeout=5, referer=None):
+    headers = dict(HEADERS)
+    if referer:
+        headers["Referer"] = referer
+    res = requests.get(url, headers=headers, timeout=timeout)
     res.encoding = encoding
     return BeautifulSoup(res.text, 'html.parser')
 
@@ -56,7 +63,7 @@ def parse_naver_sise(url):
 def get_stock_fundamentals(ticker):
     """종목 상세 페이지에서 시가총액, PER 추출"""
     try:
-        soup = fetch(f"https://finance.naver.com/item/main.naver?code={ticker}", 'utf-8', timeout=3)
+        soup = fetch(f"https://finance.naver.com/item/main.naver?code={ticker}", 'utf-8', timeout=5)
 
         ms = soup.select_one('#_market_sum')
         if ms:
@@ -77,11 +84,20 @@ def get_prev_month_close(ticker, current_price):
     """
     일별시세 페이지에서 지난달 마지막 거래일 종가를 찾아 월봉 상승률 계산.
     일별시세는 최신순으로 정렬되어 있으므로, 이번 달이 아닌 첫 행이 지난달 말일 종가.
+    
+    * sise_day.naver 페이지는 Referer 헤더가 없으면 빈 응답을 반환하므로 반드시 추가.
     """
     try:
         today = datetime.date.today()
-        soup = fetch(f"https://finance.naver.com/item/sise_day.naver?code={ticker}&page=1", 'euc-kr', timeout=3)
-        for row in soup.select('table.type2 tr'):
+        url = f"https://finance.naver.com/item/sise_day.naver?code={ticker}&page=1"
+        referer = f"https://finance.naver.com/item/sise.naver?code={ticker}"
+        soup = fetch(url, 'euc-kr', timeout=5, referer=referer)
+        
+        rows = soup.select('table.type2 tr')
+        if not rows:
+            return None
+        
+        for row in rows:
             tds = row.select('td')
             if len(tds) < 2:
                 continue
@@ -92,7 +108,8 @@ def get_prev_month_close(ticker, current_price):
             y, mo, d = map(int, dm.groups())
             # 오늘이 속한 달이 아닌 첫 거래일 = 지난달 마지막 거래일
             if (y, mo) != (today.year, today.month):
-                close = float(re.sub(r'[^\d]', '', tds[1].get_text(strip=True)) or 0)
+                close_text = tds[1].get_text(strip=True)
+                close = float(re.sub(r'[^\d]', '', close_text) or 0)
                 if close and current_price:
                     return round((current_price - close) / close * 100, 2)
                 return None
