@@ -14,11 +14,8 @@ DAYS = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요
 PROCESSED_UPDATES = []
 
 
-def fetch(url, encoding='euc-kr', timeout=5, referer=None):
-    headers = dict(HEADERS)
-    if referer:
-        headers["Referer"] = referer
-    res = requests.get(url, headers=headers, timeout=timeout)
+def fetch(url, encoding='euc-kr', timeout=5):
+    res = requests.get(url, headers=HEADERS, timeout=timeout)
     res.encoding = encoding
     return BeautifulSoup(res.text, 'html.parser')
 
@@ -82,37 +79,57 @@ def get_stock_fundamentals(ticker):
 
 def get_prev_month_close(ticker, current_price):
     """
-    일별시세 페이지에서 지난달 마지막 거래일 종가를 찾아 월봉 상승률 계산.
-    일별시세는 최신순으로 정렬되어 있으므로, 이번 달이 아닌 첫 행이 지난달 말일 종가.
+    네이버 금융 내부 차트 API (siseJson.naver)를 사용해서
+    지난달 마지막 거래일 종가를 찾아 MTD(당월 상승률) 계산.
     
-    * sise_day.naver 페이지는 Referer 헤더가 없으면 빈 응답을 반환하므로 반드시 추가.
+    HTML 스크래핑 대신 JSON API를 직접 호출하므로 차단 없이 안정적이며,
+    이 API는 네이버 차트가 실제로 사용하는 공개 엔드포인트.
+    
+    응답 형식:
+    [["날짜","시가","고가","저가","종가","거래량","외국인소진율"],
+     [20250420, 75000, 76000, 74500, 75500, 12345678, 50.5], ...]
     """
     try:
         today = datetime.date.today()
-        url = f"https://finance.naver.com/item/sise_day.naver?code={ticker}&page=1"
-        referer = f"https://finance.naver.com/item/sise.naver?code={ticker}"
-        soup = fetch(url, 'euc-kr', timeout=5, referer=referer)
-        
-        rows = soup.select('table.type2 tr')
-        if not rows:
+        # 충분히 과거(60일 전)부터 오늘까지 일봉 가져오기
+        start = (today - datetime.timedelta(days=60)).strftime("%Y%m%d")
+        end = today.strftime("%Y%m%d")
+        url = (
+            f"https://api.finance.naver.com/siseJson.naver?"
+            f"symbol={ticker}&requestType=1&startTime={start}&endTime={end}&timeframe=day"
+        )
+        res = requests.get(url, headers=HEADERS, timeout=5)
+        # 응답은 JSON 형태지만 Python literal로도 파싱 가능 (작은따옴표 사용)
+        text = res.text.strip()
+        if not text:
             return None
         
+        # Python literal_eval로 안전하게 파싱
+        import ast
+        data = ast.literal_eval(text)
+        
+        if not data or len(data) < 2:
+            return None
+        
+        # 첫 행은 헤더, 나머지는 [날짜, 시가, 고가, 저가, 종가, 거래량, ...]
+        # 날짜는 오름차순(과거→현재)
+        rows = data[1:]
+        
+        # 지난달 마지막 거래일 종가 찾기: 이번 달이 아닌 행 중 가장 최신
+        prev_close = None
         for row in rows:
-            tds = row.select('td')
-            if len(tds) < 2:
-                continue
-            date_text = tds[0].get_text(strip=True)
-            dm = re.match(r'(\d{4})\.(\d{2})\.(\d{2})', date_text)
-            if not dm:
-                continue
-            y, mo, d = map(int, dm.groups())
-            # 오늘이 속한 달이 아닌 첫 거래일 = 지난달 마지막 거래일
+            date_int = row[0]  # 예: 20250430
+            close = row[4]
+            y = date_int // 10000
+            mo = (date_int // 100) % 100
             if (y, mo) != (today.year, today.month):
-                close_text = tds[1].get_text(strip=True)
-                close = float(re.sub(r'[^\d]', '', close_text) or 0)
-                if close and current_price:
-                    return round((current_price - close) / close * 100, 2)
-                return None
+                prev_close = close  # 계속 업데이트하면 결국 "이번달 직전"의 마지막 값
+            else:
+                # 이번 달 데이터 시작 → prev_close에는 지난달 마지막 종가가 들어있음
+                break
+        
+        if prev_close and current_price:
+            return round((current_price - prev_close) / prev_close * 100, 2)
         return None
     except Exception:
         return None
